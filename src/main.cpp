@@ -53,6 +53,7 @@ static volatile bool g_isConnected = false;
 static volatile bool g_wantStart = false; // flipped in callback only
 static bool g_streaming = false;          // controlled in loop
 static uint32_t g_streamEndMs = 0;
+static uint32_t g_streamStartMs = 0; // [DEBUG] track when stream started
 static portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 // I2S (STD driver)
@@ -64,6 +65,11 @@ static int32_t g_i2sBuf32[CAPTURE_SAMPLES];             // 32-bit raw samples
 static int16_t g_pcm16Buf[CAPTURE_SAMPLES];             // converted 16-bit samples for BLE
 static uint8_t g_bleFrag[4 + BLE_PCM_BYTES_PER_NOTIFY]; // BLE notification buffer (header + audio)
 static uint16_t g_seq = 0;                              // sequence counter for BLE packets
+
+// [DEBUG] counters to understand how much we actually send
+static uint32_t g_totalSamplesSent = 0; // total int16 samples sent over BLE this stream
+static uint32_t g_totalNotifies = 0;    // total BLE notifications sent this stream
+static uint32_t g_totalI2SReads = 0;    // total I2S read calls this stream
 
 /***** ============ I2S (IDF 5.x STD) ============ *****/
 
@@ -115,6 +121,8 @@ static void i2sDeinitStd()
   }
   g_i2sReady = false;
 }
+
+/***** ============ SAMPLE CONVERSION ============ *****/
 
 static inline void convert32to16(const int32_t *in32, int16_t *out16, int n)
 {
@@ -171,6 +179,9 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
       portENTER_CRITICAL(&g_stateMux);
       g_wantStart = true;
       portEXIT_CRITICAL(&g_stateMux);
+
+      // [DEBUG] log when we actually receive START over BLE
+      Serial.println("[DEBUG] [CTRL] START command received via BLE write.");
     }
   }
 };
@@ -199,6 +210,8 @@ static void bleInit()
   adv->addServiceUUID(UUID_AUDIO_SERVICE);
   adv->setScanResponse(true);
   adv->start();
+
+  Serial.println("[DEBUG] BLE initialized, advertising started."); // [DEBUG]
 }
 
 /***** ============ STREAMING HELPERS ============ *****/
@@ -214,6 +227,10 @@ static void bleSendPcm16(const int16_t *pcm, int samples)
   int totalBytes = samples * sizeof(int16_t);
   int offset = 0;
   uint32_t tick = 0;
+
+  // [DEBUG] local flag to detect early exit
+  bool partialSend = false;
+
   while (offset < totalBytes && g_isConnected && g_streaming)
   {
     int chunk = totalBytes - offset;
@@ -224,6 +241,7 @@ static void bleSendPcm16(const int16_t *pcm, int samples)
     // Prepare 4-byte header: sequence (2 bytes) + sample count (2 bytes)
     uint16_t seq = g_seq++;
     uint16_t nSamp = chunk / 2; // number of int16 samples in this chunk
+
     memcpy(g_bleFrag, &seq, sizeof(seq));
     memcpy(g_bleFrag + 2, &nSamp, sizeof(nSamp));
     memcpy(g_bleFrag + 4, src + offset, chunk);
@@ -232,11 +250,39 @@ static void bleSendPcm16(const int16_t *pcm, int samples)
     g_audioChar->notify(); // send notification (non-blocking in NimBLE)
 
     offset += chunk;
+
+    // [DEBUG] update counters
+    g_totalSamplesSent += nSamp;
+    g_totalNotifies++;
+
+    // Occasionally print progress (not every packet to avoid spam)
+    if ((g_totalNotifies % 100) == 0)
+    {
+      float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
+      Serial.printf("[DEBUG] BLE sent %lu notifies, %lu samples (~%.2f s)\n",
+                    (unsigned long)g_totalNotifies,
+                    (unsigned long)g_totalSamplesSent,
+                    secondsApprox);
+    }
+
     // Yield periodically to avoid WDT reset
     if ((++tick & 0x7) == 0)
     {
       delay(0);
     }
+  }
+
+  if (offset < totalBytes)
+  {
+    // [DEBUG] we broke out early (disconnect or streaming flag)
+    partialSend = true;
+  }
+
+  if (partialSend)
+  {
+    Serial.printf("[DEBUG] bleSendPcm16 exited early: offset=%d totalBytes=%d, "
+                  "g_isConnected=%d g_streaming=%d\n",
+                  offset, totalBytes, (int)g_isConnected, (int)g_streaming);
   }
 }
 
@@ -278,12 +324,22 @@ void loop()
     {
       i2sInitStd(); // initialize I2S if not already
     }
+
+    // [DEBUG] reset per-stream counters
+    g_totalSamplesSent = 0;
+    g_totalNotifies = 0;
+    g_totalI2SReads = 0;
+    g_seq = 0;
+
     g_streaming = true;
-    g_streamEndMs = millis() + STREAM_MS;
-    g_seq = 0; // reset sequence counter for new stream
+    g_streamStartMs = millis(); // [DEBUG]
+    g_streamEndMs = g_streamStartMs + STREAM_MS;
 
     setPixel(255, 0, 0); // RED LED: streaming active
-    Serial.println("[CTRL] START received; streaming for 5s...");
+    Serial.printf("[CTRL] START received; streaming for %d ms...\n", STREAM_MS);
+    Serial.printf("[DEBUG] Stream window: start=%lu end=%lu\n",
+                  (unsigned long)g_streamStartMs,
+                  (unsigned long)g_streamEndMs);
   }
 
   if (g_streaming)
@@ -294,7 +350,21 @@ void loop()
       g_streaming = false;
       i2sDeinitStd();
       setPixel(0, 255, 0); // GREEN LED: stream finished, idle state
-      Serial.println("[I2S] Finished 5s capture. Streaming done; back to idle.");
+
+      uint32_t now = millis();
+      uint32_t actualDurationMs = now - g_streamStartMs;
+      float secondsApprox = (float)g_totalSamplesSent / (float)SAMPLE_RATE_HZ;
+
+      Serial.println("[I2S] Finished capture. Streaming done; back to idle.");
+      // [DEBUG] dump summary for this stream
+      Serial.printf("[DEBUG] Stream summary:\n");
+      Serial.printf("        actualDurationMs = %lu ms\n", (unsigned long)actualDurationMs);
+      Serial.printf("        totalI2SReads    = %lu\n", (unsigned long)g_totalI2SReads);
+      Serial.printf("        totalSamplesSent = %lu (~%.2f s at %d Hz)\n",
+                    (unsigned long)g_totalSamplesSent,
+                    secondsApprox,
+                    SAMPLE_RATE_HZ);
+      Serial.printf("        totalNotifies    = %lu\n", (unsigned long)g_totalNotifies);
       return;
     }
 
@@ -303,12 +373,33 @@ void loop()
     esp_err_t ret = i2s_channel_read(g_i2sRx, g_i2sBuf32, sizeof(g_i2sBuf32), &bytesRead, portMAX_DELAY);
     if (ret == ESP_OK && bytesRead > 0)
     {
-      int nSamples = bytesRead / sizeof(int32_t);
+      g_totalI2SReads++; // [DEBUG]
+
+      int nSamples = bytesRead / (int)sizeof(int32_t);
       convert32to16(g_i2sBuf32, g_pcm16Buf, nSamples);
       bleSendPcm16(g_pcm16Buf, nSamples);
+
+      // [DEBUG] Occasionally log read stats
+      if ((g_totalI2SReads % 20) == 0)
+      {
+        Serial.printf("[DEBUG] I2S read #%lu: bytesRead=%u (nSamples=%d)\n",
+                      (unsigned long)g_totalI2SReads,
+                      (unsigned int)bytesRead,
+                      nSamples);
+      }
     }
     else
     {
+      // [DEBUG] In case of read error or no data, log once in a while
+      static uint32_t errCount = 0;
+      errCount++;
+      if ((errCount % 10) == 1)
+      {
+        Serial.printf("[DEBUG] i2s_channel_read error or zero bytes: ret=%d bytesRead=%u (count=%lu)\n",
+                      (int)ret,
+                      (unsigned int)bytesRead,
+                      (unsigned long)errCount);
+      }
       // In case of read error or no data, yield briefly
       delay(1);
     }
