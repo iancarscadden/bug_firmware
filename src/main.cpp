@@ -20,11 +20,12 @@ extern "C"
 
 // Audio capture config
 #define SAMPLE_RATE_HZ 16000 // 16 kHz, speech
-#define STREAM_MS 5000       // capture 5 sec of audio
-#define CAPTURE_SAMPLES 512  // samples per I2S read (32-bit containers)
+// STREAM_MS was used for fixed 5s capture; now unused (continuous until STOP)
+// #define STREAM_MS 5000
+#define CAPTURE_SAMPLES 512 // samples per I2S read (32-bit containers)
 
 // BLE batching config
-#define NOTIFY_SAMPLES 120 // target samples per notify
+#define NOTIFY_SAMPLES 120 // target samples per notify (fits MTU)
 #define BLE_PCM_BYTES_PER_NOTIFY (NOTIFY_SAMPLES * sizeof(int16_t))
 #define NOTIFY_INTERVAL_MS 15 // ~15 ms between notifies
 
@@ -57,9 +58,11 @@ static NimBLECharacteristic *g_audioChar = nullptr;
 
 static volatile bool g_isConnected = false;
 static volatile bool g_wantStart = false; // set only from callback
-static bool g_streaming = false;          // overall session active
-static bool g_captureActive = false;      // still pulling from I2S
-static uint32_t g_captureEndMs = 0;
+static volatile bool g_wantStop = false;  // NEW: STOP flag set only from callback
+
+static bool g_streaming = false;     // overall session active (ring draining + BLE)
+static bool g_captureActive = false; // still pulling from I2S into ring
+
 static uint32_t g_streamStartMs = 0;
 static uint32_t g_nextNotifyMs = 0;
 static portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -205,6 +208,7 @@ class ServerCB : public NimBLEServerCallbacks
 
     portENTER_CRITICAL(&g_stateMux);
     g_wantStart = false;
+    g_wantStop = false; // clear STOP flag on disconnect
     portEXIT_CRITICAL(&g_stateMux);
 
     g_streaming = false;
@@ -226,6 +230,7 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
     {
       ch = toupper((unsigned char)ch);
     }
+
     if (val.find("START") != std::string::npos)
     {
       portENTER_CRITICAL(&g_stateMux);
@@ -233,6 +238,16 @@ class ControlWriteCB : public NimBLECharacteristicCallbacks
       portEXIT_CRITICAL(&g_stateMux);
 
       Serial.println("[DEBUG] [CTRL] START command received via BLE write.");
+    }
+
+    // NEW: STOP handling
+    if (val.find("STOP") != std::string::npos)
+    {
+      portENTER_CRITICAL(&g_stateMux);
+      g_wantStop = true;
+      portEXIT_CRITICAL(&g_stateMux);
+
+      Serial.println("[DEBUG] [CTRL] STOP command received via BLE write.");
     }
   }
 };
@@ -338,6 +353,7 @@ void loop()
   {
     portENTER_CRITICAL(&g_stateMux);
     g_wantStart = false;
+    g_wantStop = false; // clear any stale STOP
     portEXIT_CRITICAL(&g_stateMux);
 
     if (!g_i2sReady)
@@ -352,17 +368,13 @@ void loop()
     g_totalNotifies = 0;
     g_totalI2SReads = 0;
 
-    g_streaming = true;
-    g_captureActive = true;
+    g_streaming = true;     // session active
+    g_captureActive = true; // actively pulling from I2S
     g_streamStartMs = millis();
-    g_captureEndMs = g_streamStartMs + STREAM_MS;
     g_nextNotifyMs = g_streamStartMs; // first notify can go out ASAP
 
     setPixel(255, 0, 0); // RED: active capture/stream
-    Serial.printf("[CTRL] START received; capturing for %d ms...\n", STREAM_MS);
-    Serial.printf("[DEBUG] Capture window: start=%lu end=%lu\n",
-                  (unsigned long)g_streamStartMs,
-                  (unsigned long)g_captureEndMs);
+    Serial.println("[CTRL] START received; beginning continuous capture (until STOP)...");
   }
 
   if (!g_streaming)
@@ -377,13 +389,17 @@ void loop()
   /***** 1) CAPTURE: read from I2S into ring while captureActive *****/
   if (g_captureActive)
   {
-    // End capture window?
-    if ((int32_t)(now - g_captureEndMs) >= 0)
+    // NEW: STOP-based termination instead of time-based
+    if (g_wantStop)
     {
+      portENTER_CRITICAL(&g_stateMux);
+      g_wantStop = false;
+      portEXIT_CRITICAL(&g_stateMux);
+
       g_captureActive = false;
       i2sDeinitStd();
 
-      Serial.println("[I2S] Capture window finished; stopping I2S.");
+      Serial.println("[I2S] STOP command received; stopping I2S capture.");
       if (g_droppedSamples > 0)
       {
         Serial.printf("[DEBUG] Ring overflow during capture, dropped %lu samples.\n",
@@ -425,7 +441,6 @@ void loop()
       g_ringCount > 0 &&
       (int32_t)(now - g_nextNotifyMs) >= 0)
   {
-
     bleSendNextChunk();
     g_nextNotifyMs = now + NOTIFY_INTERVAL_MS;
   }
